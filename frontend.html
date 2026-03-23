@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Chat Interface</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+
+        #startButton {
+            background-color: #4CAF50;
+            color: white;
+        }
+
+        #stopButton {
+            background-color: #f44336;
+            color: white;
+        }
+
+        #interruptButton {
+            background-color: #ff9800;
+            color: white;
+        }
+
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+
+        #status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 5px;
+            background-color: #e8f5e9;
+        }
+
+        .status-connected {
+            background-color: #e8f5e9 !important;
+        }
+
+        .status-disconnected {
+            background-color: #ffebee !important;
+        }
+
+        .messages {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: white;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+            min-height: 100px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .message {
+            margin-bottom: 10px;
+            padding: 8px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Voice Chat Interface</h1>
+        <div class="controls">
+            <button id="startButton">Start Recording</button>
+            <button id="stopButton" disabled>Stop Recording</button>
+            <button id="interruptButton">Interrupt</button>
+        </div>
+        <div id="status">Status: Disconnected</div>
+        <div id="messages" class="messages"></div>
+    </div>
+
+    <script>
+        class AudioStreamer {
+            constructor(wsHost = 'localhost:8000') {
+                this.wsHost = wsHost;
+                this.ws = null;
+                this.mediaRecorder = null;
+                this.audioContext = null;
+                this.isRecording = false;
+                this.clientId = 'client_' + Math.random().toString(36).substr(2, 9);
+                
+                this.startButton = document.getElementById('startButton');
+                this.stopButton = document.getElementById('stopButton');
+                this.interruptButton = document.getElementById('interruptButton');
+                this.statusDiv = document.getElementById('status');
+
+                // Don't create AudioContext here
+                this.playbackContext = null;
+                this.audioQueue = [];
+                this.isPlaying = false;
+
+                // Setup button event listeners
+                this.startButton.addEventListener('click', () => this.startRecording());
+                this.stopButton.addEventListener('click', () => this.stopRecording());
+                this.interruptButton.addEventListener('click', () => this.sendInterrupt());
+
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === '`') {
+                        this.sendInterrupt();
+                    }
+                });
+
+                // Add connection state
+                this.isConnecting = false;
+                this.connectionAttempts = 0;
+
+                this.textWs = null;
+                this.messagesDiv = document.getElementById('messages');
+                
+                // Add text websocket connection to initialization
+                this.connectTextWebSocket();
+            }
+
+            async checkServer() {
+                console.log('Checking server availability...');
+                try {
+                    const response = await fetch(`http://${this.wsHost}/`, {
+                        mode: 'cors',
+                        headers: {
+                            'Accept': 'application/json'
+                        }
+                    });
+                    console.log('Server response:', response.status);
+                    if (!response.ok) {
+                        throw new Error(`Server returned ${response.status}`);
+                    }
+                    return true;
+                } catch (error) {
+                    console.error('Server check failed:', error);
+                    console.log('Proceeding with WebSocket connection attempt...');
+                    return true;
+                }
+            }
+
+            async connectWebSocket() {
+                console.log('Starting WebSocket connection...');
+                
+                // Reset connection state
+                if (this.ws) {
+                    console.log('Closing existing WebSocket connection');
+                    this.ws.close();
+                    this.ws = null;
+                }
+                this.isConnecting = false;
+
+                return new Promise((resolve, reject) => {
+                    try {
+                        if (this.isConnecting) {
+                            throw new Error('Connection already in progress');
+                        }
+
+                        this.isConnecting = true;
+                        const wsUrl = `ws://${this.wsHost}/ws/${this.clientId}`;
+                        console.log('Creating new WebSocket connection to:', wsUrl);
+                        
+                        this.ws = new WebSocket(wsUrl);
+
+                        const connectionTimeout = setTimeout(() => {
+                            console.log('Connection attempt timed out');
+                            if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
+                                this.ws.close();
+                                this.ws = null;
+                                this.isConnecting = false;
+                                reject(new Error('Connection timeout'));
+                            }
+                        }, 5000);
+
+                        this.ws.onopen = () => {
+                            console.log('WebSocket connection established');
+                            clearTimeout(connectionTimeout);
+                            this.isConnecting = false;
+                            this.updateStatus('Connected', true);
+
+                            // Setup message handler
+                            this.ws.onmessage = async (event) => {
+                                try {
+                                    // Check if the message is JSON
+                                    if (typeof event.data === 'string') {
+                                        try {
+                                            const jsonData = JSON.parse(event.data);
+                                            if (jsonData.type === 'should_stop') {
+                                                console.log('Received stop signal from backend');
+                                                // Clear audio queue
+                                                this.audioQueue = [];
+                                                this.isPlaying = false;
+                                                
+                                                // Stop currently playing audio
+                                                if (this.currentSource) {
+                                                    this.currentSource.stop();
+                                                    this.currentSource.disconnect();
+                                                    this.currentSource = null;
+                                                }
+                                                
+                                                this.updateStatus('Stopped', false);
+                                                return;
+                                            }
+                                        } catch (e) {
+                                            // Not JSON data, continue with normal audio processing
+                                        }
+                                    }
+
+                                    if (event.data instanceof Blob) {
+                                        const arrayBuffer = await event.data.arrayBuffer();
+                                        this.audioQueue.push(arrayBuffer);
+                                        
+                                        if (!this.isPlaying) {
+                                            await this.playNextChunk();
+                                        }
+                                    }
+                                } catch (error) {
+                                    console.error('Error handling audio chunk:', error);
+                                }
+                            };
+                            
+                            resolve();
+                        };
+
+                        this.ws.onclose = (event) => {
+                            console.log('WebSocket connection closed:', event);
+                            clearTimeout(connectionTimeout);
+                            this.isConnecting = false;
+                            this.ws = null;
+                            reject(new Error('Connection closed'));
+                        };
+
+                        this.ws.onerror = (error) => {
+                            console.error('WebSocket error:', error);
+                            clearTimeout(connectionTimeout);
+                            this.isConnecting = false;
+                            this.ws = null;
+                            reject(new Error('Connection error'));
+                        };
+
+                    } catch (error) {
+                        console.error('Error in connectWebSocket:', error);
+                        this.isConnecting = false;
+                        this.ws = null;
+                        reject(error);
+                    }
+                });
+            }
+
+            async connectTextWebSocket() {
+                const wsUrl = `ws://${this.wsHost}/ws/text/${this.clientId}`;
+                console.log('Creating text WebSocket connection to:', wsUrl);
+                
+                this.textWs = new WebSocket(wsUrl);
+                
+                this.textWs.onopen = () => {
+                    console.log('Text WebSocket connected');
+                    // Send an initial message to keep the connection alive
+                    this.textWs.send('init');
+                };
+
+                this.textWs.onmessage = (event) => {
+                    console.log('Received text data:', event.data);
+                    try {
+                        const message = typeof event.data === 'string' ? event.data : JSON.parse(event.data);
+                        console.log('Parsed message:', message);
+                        this.displayMessage(message);
+                    } catch (error) {
+                        console.error('Error processing text message:', error);
+                        this.displayMessage(event.data);
+                    }
+                };
+
+                this.textWs.onclose = () => {
+                    console.log('Text WebSocket closed, attempting to reconnect...');
+                    setTimeout(() => this.connectTextWebSocket(), 1000);
+                };
+
+                this.textWs.onerror = (error) => {
+                    console.error('Text WebSocket error:', error);
+                };
+            }
+
+            displayMessage(message) {
+                const messageElement = document.createElement('div');
+                messageElement.className = 'message';
+                messageElement.textContent = message.text || JSON.stringify(message);
+                this.messagesDiv.appendChild(messageElement);
+                this.messagesDiv.scrollTop = this.messagesDiv.scrollHeight;
+            }
+
+            updateStatus(message, isConnected) {
+                this.statusDiv.textContent = `Status: ${message}`;
+                this.statusDiv.className = isConnected ? 'status-connected' : 'status-disconnected';
+            }
+
+            async startRecording() {
+                console.log('=== Starting new recording session ===');
+                try {
+                    // Try server check but don't fail if it doesn't work
+                    await this.checkServer().catch(console.error);
+                    
+                    console.log('Initializing audio context');
+                    if (!this.playbackContext) {
+                        this.playbackContext = new (window.AudioContext || window.webkitAudioContext)({
+                            sampleRate: 16000
+                        });
+                    }
+                    
+                    if (this.playbackContext.state === 'suspended') {
+                        console.log('Resuming audio context');
+                        await this.playbackContext.resume();
+                    }
+
+                    console.log('Cleaning up existing connections');
+                    await this.cleanup();
+                    
+                    this.connectionAttempts = 0;
+                    let lastError = null;
+
+                    while (this.connectionAttempts < 3) {
+                        try {
+                            this.connectionAttempts++;
+                            console.log(`\nAttempting connection ${this.connectionAttempts}/3`);
+                            this.updateStatus(`Connecting (attempt ${this.connectionAttempts}/3)...`, false);
+                            await this.connectWebSocket();
+                            
+                            console.log('Connection successful, setting up audio stream');
+                            await this.setupAudioStream();
+                            return;  // Success! Exit the method
+                            
+                        } catch (error) {
+                            console.log(`Connection attempt ${this.connectionAttempts} failed:`, error.message);
+                            lastError = error;
+                            if (this.connectionAttempts < 3) {
+                                console.log('Waiting before retry...');
+                                await new Promise(resolve => setTimeout(resolve, 1000));
+                            }
+                        }
+                    }
+
+                    throw lastError || new Error('Failed to connect after 3 attempts');
+
+                } catch (error) {
+                    console.error('Recording session failed:', error);
+                    this.updateStatus(`Error: ${error.message}`, false);
+                    await this.cleanup();
+                }
+            }
+
+            async setupAudioStream() {
+                console.log('Setting up audio stream');
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+                
+                this.audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = this.audioContext.createMediaStreamSource(stream);
+                const processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+
+                source.connect(processor);
+                processor.connect(this.audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (this.isRecording && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        const audioData = e.inputBuffer.getChannelData(0);
+                        const pcmData = new Int16Array(audioData.length);
+                        for (let i = 0; i < audioData.length; i++) {
+                            pcmData[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
+                        }
+                        
+                        const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+                        this.ws.send(JSON.stringify({
+                            type: 'audio',
+                            data: base64Data
+                        }));
+                    }
+                };
+
+                this.isRecording = true;
+                this.startButton.disabled = true;
+                this.stopButton.disabled = false;
+                this.updateStatus('Recording...', true);
+            }
+
+            async cleanup() {
+                this.isRecording = false;
+                this.isPlaying = false;
+                this.isConnecting = false;
+                this.connectionAttempts = 0;
+                this.audioQueue = [];
+                
+                if (this.ws) {
+                    this.ws.close();
+                    this.ws = null;
+                }
+                
+                if (this.audioContext) {
+                    await this.audioContext.close();
+                    this.audioContext = null;
+                }
+
+                if (this.textWs) {
+                    this.textWs.close();
+                    this.textWs = null;
+                }
+            }
+
+            async stopRecording() {
+                await this.cleanup();
+                this.startButton.disabled = false;
+                this.stopButton.disabled = true;
+                this.updateStatus('Stopped', false);
+            }
+
+            sendInterrupt() {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({
+                        type: 'interrupt'
+                    }));
+                }
+            }
+
+            async playNextChunk() {
+                if (this.isPlaying || this.audioQueue.length === 0) return;
+                
+                this.isPlaying = true;
+                const arrayBuffer = this.audioQueue.shift();
+                
+                try {
+                    const audioBuffer = await this.playbackContext.decodeAudioData(arrayBuffer);
+                    const source = this.playbackContext.createBufferSource();
+                    this.currentSource = source;  // Store reference to current source
+                    const gainNode = this.playbackContext.createGain();
+                    
+                    source.buffer = audioBuffer;
+                    source.connect(gainNode);
+                    gainNode.connect(this.playbackContext.destination);
+                    
+                    source.onended = () => {
+                        this.isPlaying = false;
+                        this.currentSource = null;  // Clear reference
+                        source.onended = null;
+                        
+                        if (this.audioQueue.length === 0 && !this.isPlaying) {
+                            console.log('Last audio chunk finished playing');
+                            this.updateStatus('Connected', true);
+                            
+                            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                                console.log('Sending playback_complete signal to backend');
+                                this.ws.send(JSON.stringify({
+                                    type: 'playback_complete'
+                                }));
+                            }
+                        } else if (this.audioQueue.length > 0) {
+                            this.playNextChunk();
+                        }
+                    };
+                    
+                    source.start(0);
+                    
+                } catch (error) {
+                    console.error('Error playing audio chunk:', error);
+                    this.isPlaying = false;
+                    this.currentSource = null;  // Clear reference on error
+                    if (this.audioQueue.length === 0 && !this.isPlaying) {
+                        // Send completion signal if this was the last chunk and it errored
+                        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                            console.log('Sending playback_complete signal after error');
+                            this.ws.send(JSON.stringify({
+                                type: 'playback_complete'
+                            }));
+                        }
+                    } else if (this.audioQueue.length > 0) {
+                        this.playNextChunk();
+                    }
+                }
+            }
+        }
+
+        // Initialize the audio streamer when the page loads
+        window.addEventListener('load', () => {
+            new AudioStreamer('localhost:8000');  // Explicitly pass the host
+        });
+    </script>
+</body>
+</html> 
